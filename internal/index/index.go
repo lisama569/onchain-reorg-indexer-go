@@ -315,6 +315,9 @@ func (ix *Indexer) reorgLocked(ctx context.Context, d *decoded, tipHeight uint64
 	// Atomic rollback + replay.
 	err := ix.store.Update(ctx, func(tx store.Tx) error {
 		for rh := tipHeight; rh > ancestor && rh >= ix.cfg.StartHeight; rh-- {
+			if err := tx.DeleteAddressTxsByBlock(rh); err != nil {
+				return err
+			}
 			if err := tx.DeleteTxsByBlock(rh); err != nil {
 				return err
 			}
@@ -327,7 +330,7 @@ func (ix *Indexer) reorgLocked(ctx context.Context, d *decoded, tipHeight uint64
 				return err
 			}
 			for _, t := range rd.txs {
-				if err := tx.PutTx(t); err != nil {
+				if err := putTxWithAddressRefs(tx, t); err != nil {
 					return err
 				}
 			}
@@ -427,13 +430,38 @@ func (ix *Indexer) rejectLink(ctx context.Context, d *decoded, reason, detail st
 		Reason: reason, Detail: detail, Tip: ix.tipHeight(ctx)}, nil
 }
 
+// putTxWithAddressRefs writes one canonical tx plus its derived address
+// entries inside the same store transaction, so the two can never diverge.
+func putTxWithAddressRefs(tx store.Tx, t model.IndexedTx) error {
+	if err := tx.PutTx(t); err != nil {
+		return err
+	}
+	ref := model.AddressTxRef{
+		Height:  t.BlockHeight,
+		TxIndex: t.Index,
+		TxHash:  t.TxHash,
+		From:    t.From,
+		To:      t.To,
+		Amount:  t.Amount,
+	}
+	if err := tx.PutAddressTx(t.From, ref); err != nil {
+		return err
+	}
+	if t.To != t.From {
+		if err := tx.PutAddressTx(t.To, ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (ix *Indexer) putBlock(ctx context.Context, d *decoded) error {
 	return ix.store.Update(ctx, func(tx store.Tx) error {
 		if err := tx.PutBlock(d.block); err != nil {
 			return err
 		}
 		for _, t := range d.txs {
-			if err := tx.PutTx(t); err != nil {
+			if err := putTxWithAddressRefs(tx, t); err != nil {
 				return err
 			}
 		}
@@ -562,6 +590,48 @@ func (ix *Indexer) Stats(ctx context.Context) (Stats, error) {
 		st.Blocks = int(st.NextHeight - ix.cfg.StartHeight)
 	}
 	return st, nil
+}
+
+// AddressTxPage is one page of the derived address-transaction query.
+type AddressTxPage struct {
+	Txs []model.AddressTxRef
+	// NextCursor resumes the listing; pass it back to QueryAddressTxs.
+	NextCursor model.AddressCursor
+	HasMore    bool
+}
+
+// QueryAddressTxs returns the transactions involving addr (as sender or
+// receiver), ordered by (block height, in-block index), paginated by cursor.
+// limit <= 0 returns the remaining entries. The result reflects exactly the
+// canonical indexed chain: rolled-back branches never appear.
+func (ix *Indexer) QueryAddressTxs(ctx context.Context, addr model.Address, cursor model.AddressCursor, limit int) (AddressTxPage, error) {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	var page AddressTxPage
+	err := ix.store.View(ctx, func(tx store.Tx) error {
+		refs, next, more, verr := tx.ListAddressTxs(addr, cursor, limit)
+		if verr != nil {
+			return verr
+		}
+		page = AddressTxPage{Txs: refs, NextCursor: next, HasMore: more}
+		return nil
+	})
+	return page, err
+}
+
+// AddressSummary returns the maintained aggregate (tx count, total in/out)
+// for addr in O(1). ok is false when the address has no indexed activity.
+func (ix *Indexer) AddressSummary(ctx context.Context, addr model.Address) (model.AddressSummary, bool, error) {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	var sum model.AddressSummary
+	var ok bool
+	err := ix.store.View(ctx, func(tx store.Tx) error {
+		var verr error
+		sum, ok, verr = tx.GetAddressSummary(addr)
+		return verr
+	})
+	return sum, ok, err
 }
 
 // Close releases resources and flushes the final snapshot.

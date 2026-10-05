@@ -65,6 +65,38 @@ type IndexedTx struct {
 	Amount      int64
 }
 
+// AddressTxRef is one derived address-index entry: it records that the
+// address participated in the transaction (Height, TxIndex) as sender and/or
+// receiver. It is derived state: always written/deleted in the same
+// transaction as the canonical IndexedTx it points to, so the address index
+// can never disagree with the main index.
+type AddressTxRef struct {
+	Height  uint64
+	TxIndex int
+	TxHash  Hash
+	From    Address
+	To      Address
+	Amount  int64
+}
+
+// AddressCursor is a stable pagination position inside one address' entry
+// list. The zero value means "from the beginning".
+type AddressCursor struct {
+	Height  uint64
+	TxIndex int
+	Started bool
+}
+
+// AddressSummary is the incrementally maintained aggregate for one address.
+// A transaction counts once even when From == To == address (self-transfer);
+// in that case its amount contributes to both TotalIn and TotalOut.
+type AddressSummary struct {
+	Address  Address
+	TxCount  int
+	TotalIn  int64
+	TotalOut int64
+}
+
 // Failure reason codes. Each malformed input is rejected with one of these
 // stable codes instead of being silently dropped.
 const (

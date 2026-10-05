@@ -22,6 +22,18 @@ type MemoryStore struct {
 	byHash   map[model.Hash]uint64
 	txs      map[uint64][]model.IndexedTx
 	failures map[string]model.FailureRecord
+	// maxHeight/hasBlocks are maintained incrementally so MaxHeight is O(1)
+	// regardless of chain length (ingestion calls it once per block).
+	maxHeight uint64
+	hasBlocks bool
+	// Derived address index. addrTxs keeps each address' entries sorted by
+	// (Height, TxIndex); addrByHeight maps a height to the set of addresses
+	// it touches so rollback deletion is bounded by the entries at that
+	// height; addrSummary holds the O(1) aggregates. All three are mutated
+	// only inside committed transactions alongside the canonical records.
+	addrTxs      map[model.Address][]model.AddressTxRef
+	addrByHeight map[uint64]map[model.Address]struct{}
+	addrSummary  map[model.Address]*model.AddressSummary
 }
 
 // NewMemoryStore creates an empty in-memory store.
@@ -41,11 +53,14 @@ func NewFileBackedMemoryStore(path string) (*MemoryStore, error) {
 
 func newMemory(path string) *MemoryStore {
 	return &MemoryStore{
-		path:     path,
-		blocks:   map[uint64]model.IndexedBlock{},
-		byHash:   map[model.Hash]uint64{},
-		txs:      map[uint64][]model.IndexedTx{},
-		failures: map[string]model.FailureRecord{},
+		path:         path,
+		blocks:       map[uint64]model.IndexedBlock{},
+		byHash:       map[model.Hash]uint64{},
+		txs:          map[uint64][]model.IndexedTx{},
+		failures:     map[string]model.FailureRecord{},
+		addrTxs:      map[model.Address][]model.AddressTxRef{},
+		addrByHeight: map[uint64]map[model.Address]struct{}{},
+		addrSummary:  map[model.Address]*model.AddressSummary{},
 	}
 }
 
@@ -77,6 +92,10 @@ func (t *memTx) PutBlock(b model.IndexedBlock) error {
 		}
 		t.s.blocks[b.Height] = b
 		t.s.byHash[b.Hash] = b.Height
+		if !t.s.hasBlocks || b.Height > t.s.maxHeight {
+			t.s.maxHeight = b.Height
+			t.s.hasBlocks = true
+		}
 	})
 	return nil
 }
@@ -86,6 +105,22 @@ func (t *memTx) DeleteBlock(height uint64) error {
 		if b, ok := t.s.blocks[height]; ok {
 			delete(t.s.byHash, b.Hash)
 			delete(t.s.blocks, height)
+		}
+		if t.s.hasBlocks && height == t.s.maxHeight {
+			// Rollback deletes from the tip downward, so height-1 is normally
+			// the new tip; only fall back to a scan if a gap makes that untrue.
+			if _, ok := t.s.blocks[height-1]; height > 0 && ok {
+				t.s.maxHeight = height - 1
+			} else {
+				t.s.maxHeight = 0
+				t.s.hasBlocks = false
+				for h := range t.s.blocks {
+					if !t.s.hasBlocks || h > t.s.maxHeight {
+						t.s.maxHeight = h
+						t.s.hasBlocks = true
+					}
+				}
+			}
 		}
 	})
 	return nil
@@ -109,6 +144,125 @@ func (t *memTx) ListTxs(height uint64) ([]model.IndexedTx, error) {
 	out := append([]model.IndexedTx(nil), t.s.txs[height]...)
 	sort.Slice(out, func(i, j int) bool { return out[i].Index < out[j].Index })
 	return out, nil
+}
+
+// ---- derived address index ----
+
+// addrLess orders entries by (Height, TxIndex).
+func addrLess(a, b model.AddressTxRef) bool {
+	if a.Height != b.Height {
+		return a.Height < b.Height
+	}
+	return a.TxIndex < b.TxIndex
+}
+
+// applyAddressTx mutates the derived index; shared by PutAddressTx commits
+// and snapshot-load rebuilds. Idempotent per (addr, Height, TxIndex).
+func (s *MemoryStore) applyAddressTx(addr model.Address, ref model.AddressTxRef) {
+	entries := s.addrTxs[addr]
+	pos := sort.Search(len(entries), func(i int) bool { return !addrLess(entries[i], ref) })
+	if pos < len(entries) && entries[pos].Height == ref.Height && entries[pos].TxIndex == ref.TxIndex {
+		return // already indexed (replay / duplicate): never double-count
+	}
+	entries = append(entries, model.AddressTxRef{})
+	copy(entries[pos+1:], entries[pos:])
+	entries[pos] = ref
+	s.addrTxs[addr] = entries
+
+	set := s.addrByHeight[ref.Height]
+	if set == nil {
+		set = map[model.Address]struct{}{}
+		s.addrByHeight[ref.Height] = set
+	}
+	set[addr] = struct{}{}
+
+	sum := s.addrSummary[addr]
+	if sum == nil {
+		sum = &model.AddressSummary{Address: addr}
+		s.addrSummary[addr] = sum
+	}
+	sum.TxCount++
+	if ref.From == addr {
+		sum.TotalOut += ref.Amount
+	}
+	if ref.To == addr {
+		sum.TotalIn += ref.Amount
+	}
+}
+
+func (t *memTx) PutAddressTx(addr model.Address, ref model.AddressTxRef) error {
+	t.mutations = append(t.mutations, func() { t.s.applyAddressTx(addr, ref) })
+	return nil
+}
+
+func (t *memTx) DeleteAddressTxsByBlock(height uint64) error {
+	t.mutations = append(t.mutations, func() {
+		set := t.s.addrByHeight[height]
+		if len(set) == 0 {
+			return
+		}
+		for addr := range set {
+			entries := t.s.addrTxs[addr]
+			// Entries are sorted by height; everything at/above this height
+			// is a suffix. Cost is bounded by the entries at this height.
+			cut := sort.Search(len(entries), func(i int) bool { return entries[i].Height >= height })
+			sum := t.s.addrSummary[addr]
+			for _, ref := range entries[cut:] {
+				if sum != nil {
+					sum.TxCount--
+					if ref.From == addr {
+						sum.TotalOut -= ref.Amount
+					}
+					if ref.To == addr {
+						sum.TotalIn -= ref.Amount
+					}
+				}
+			}
+			entries = entries[:cut]
+			if len(entries) == 0 {
+				delete(t.s.addrTxs, addr)
+				delete(t.s.addrSummary, addr)
+			} else {
+				t.s.addrTxs[addr] = entries
+			}
+		}
+		delete(t.s.addrByHeight, height)
+	})
+	return nil
+}
+
+func (t *memTx) ListAddressTxs(addr model.Address, cursor model.AddressCursor, limit int) ([]model.AddressTxRef, model.AddressCursor, bool, error) {
+	entries := t.s.addrTxs[addr]
+	start := 0
+	if cursor.Started {
+		// First entry strictly after the cursor position.
+		start = sort.Search(len(entries), func(i int) bool {
+			e := entries[i]
+			return e.Height > cursor.Height || (e.Height == cursor.Height && e.TxIndex > cursor.TxIndex)
+		})
+	}
+	if limit <= 0 {
+		limit = len(entries) - start
+	}
+	end := start + limit
+	if end > len(entries) {
+		end = len(entries)
+	}
+	out := append([]model.AddressTxRef(nil), entries[start:end]...)
+	next := cursor
+	if len(out) > 0 {
+		last := out[len(out)-1]
+		next = model.AddressCursor{Height: last.Height, TxIndex: last.TxIndex, Started: true}
+	}
+	return out, next, end < len(entries), nil
+}
+
+func (t *memTx) GetAddressSummary(addr model.Address) (model.AddressSummary, bool, error) {
+	sum, ok := t.s.addrSummary[addr]
+	if !ok {
+		return model.AddressSummary{}, false, nil
+	}
+	return *sum, true, nil
 }
 
 func (t *memTx) PutFailure(f model.FailureRecord) (bool, error) {
@@ -135,16 +289,7 @@ func (t *memTx) ListFailures() ([]model.FailureRecord, error) {
 }
 
 func (t *memTx) MaxHeight() (uint64, bool, error) {
-	if len(t.s.blocks) == 0 {
-		return 0, false, nil
-	}
-	max := uint64(0)
-	for h := range t.s.blocks {
-		if h > max {
-			max = h
-		}
-	}
-	return max, true, nil
+	return t.s.maxHeight, t.s.hasBlocks, nil
 }
 
 func (t *memTx) Commit() error {
@@ -217,12 +362,42 @@ func (s *MemoryStore) load() error {
 	for _, b := range snap.Blocks {
 		s.blocks[b.Height] = b
 		s.byHash[b.Hash] = b.Height
+		if !s.hasBlocks || b.Height > s.maxHeight {
+			s.maxHeight = b.Height
+			s.hasBlocks = true
+		}
 	}
 	for h, list := range snap.Txs {
 		s.txs[h] = list
 	}
 	for _, f := range snap.Failures {
 		s.failures[f.Fingerprint()] = f
+	}
+	// Rebuild the derived address index from the canonical txs. The snapshot
+	// only persists canonical state, so rolled-back branches can never
+	// reappear in address queries after a restart.
+	heights := make([]uint64, 0, len(s.txs))
+	for h := range s.txs {
+		heights = append(heights, h)
+	}
+	sort.Slice(heights, func(i, j int) bool { return heights[i] < heights[j] })
+	for _, h := range heights {
+		list := append([]model.IndexedTx(nil), s.txs[h]...)
+		sort.Slice(list, func(i, j int) bool { return list[i].Index < list[j].Index })
+		for _, tx := range list {
+			ref := model.AddressTxRef{
+				Height:  tx.BlockHeight,
+				TxIndex: tx.Index,
+				TxHash:  tx.TxHash,
+				From:    tx.From,
+				To:      tx.To,
+				Amount:  tx.Amount,
+			}
+			s.applyAddressTx(tx.From, ref)
+			if tx.To != tx.From {
+				s.applyAddressTx(tx.To, ref)
+			}
+		}
 	}
 	return nil
 }

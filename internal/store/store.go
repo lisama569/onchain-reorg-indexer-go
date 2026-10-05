@@ -16,6 +16,20 @@ type Tx interface {
 	PutTx(tx model.IndexedTx) error
 	DeleteTxsByBlock(height uint64) error
 	ListTxs(height uint64) ([]model.IndexedTx, error)
+	// PutAddressTx records one derived address-index entry. It is idempotent
+	// per (Address implied by the caller, Height, TxIndex): re-applying the
+	// same entry is a no-op so replays never double-count.
+	PutAddressTx(addr model.Address, ref model.AddressTxRef) error
+	// DeleteAddressTxsByBlock removes every derived entry at height and
+	// adjusts the affected summaries. Cost is bounded by the number of
+	// entries at that height, not by total history.
+	DeleteAddressTxsByBlock(height uint64) error
+	// ListAddressTxs returns up to limit entries for addr strictly after
+	// cursor, ordered by (Height, TxIndex). The returned cursor resumes the
+	// next page; hasMore reports whether more entries exist.
+	ListAddressTxs(addr model.Address, cursor model.AddressCursor, limit int) (refs []model.AddressTxRef, next model.AddressCursor, hasMore bool, err error)
+	// GetAddressSummary returns the maintained aggregate for addr in O(1).
+	GetAddressSummary(addr model.Address) (model.AddressSummary, bool, error)
 	PutFailure(f model.FailureRecord) (bool, error)
 	ListFailures() ([]model.FailureRecord, error)
 	MaxHeight() (uint64, bool, error)

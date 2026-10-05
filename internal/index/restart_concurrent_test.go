@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/chain"
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/store"
@@ -106,11 +107,24 @@ func TestConcurrentIngestionIsLossless(t *testing.T) {
 			for len(delivered) < int(total) {
 				head := sim.Head()
 				round++
+				// Head() on a still-empty chain is start-1, which underflows
+				// to MaxUint64 when start == 0; only scan heights this test
+				// will ever produce. Without the cap a worker that wins the
+				// race against the grower spins to 2^64 and OOMs.
+				scanTo := head
+				if max := start + total - 1; scanTo > max {
+					scanTo = max
+				}
 				missing := make([]uint64, 0)
-				for hh := start; hh <= head; hh++ {
+				for hh := start; hh <= scanTo; hh++ {
 					if !delivered[hh] {
 						missing = append(missing, hh)
 					}
+				}
+				if len(missing) == 0 {
+					// Chain not grown yet; yield instead of busy-spinning.
+					time.Sleep(time.Millisecond)
+					continue
 				}
 				idx := perm(w*31+round, len(missing), 0)
 				shuffled := make([]uint64, len(missing))

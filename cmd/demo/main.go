@@ -12,6 +12,7 @@ import (
 
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/chain"
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/index"
+	"github.com/lisama569/onchain-reorg-indexer-go/internal/model"
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/store"
 )
 
@@ -87,6 +88,29 @@ func main() {
 	}
 	wg.Wait()
 	printStats(ctx, ix2)
+
+	fmt.Println("\n== phase 5: address query + summary on the derived index ==")
+	// Pick a real address from an indexed transaction and query it back.
+	var pick model.Address
+	must(st2.View(ctx, func(tx store.Tx) error {
+		txs, err := tx.ListTxs(startHeight)
+		if err != nil || len(txs) == 0 {
+			return fmt.Errorf("no txs at %d: %w", startHeight, err)
+		}
+		pick = txs[0].From
+		return nil
+	}))
+	page, err := ix2.QueryAddressTxs(ctx, pick, model.AddressCursor{}, 10)
+	must(err)
+	fmt.Printf("address %s involved in %d tx(s) (has_more=%v)\n", pick.Hex(), len(page.Txs), page.HasMore)
+	for _, ref := range page.Txs {
+		fmt.Printf("  height=%d tx_index=%d tx=%s amount=%d\n", ref.Height, ref.TxIndex, ref.TxHash.Short(), ref.Amount)
+	}
+	sum, ok, err := ix2.AddressSummary(ctx, pick)
+	must(err)
+	if ok {
+		fmt.Printf("summary: tx_count=%d total_in=%d total_out=%d\n", sum.TxCount, sum.TotalIn, sum.TotalOut)
+	}
 	must(ix2.Close())
 
 	fmt.Println("\nsnapshot written to", snap)

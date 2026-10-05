@@ -9,6 +9,39 @@ import (
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/store"
 )
 
+// BenchmarkIngestAtScale measures steady-state per-block ingestion cost at
+// increasing chain lengths. Per-block cost must stay flat: MaxHeight is O(1),
+// each block is one transaction, and the derived address index is updated
+// per-tx in the same commit.
+func BenchmarkIngestAtScale(b *testing.B) {
+	ctx := context.Background()
+	for _, total := range []int{1024, 8192, 32768} {
+		b.Run(fmt.Sprintf("chain=%d", total), func(b *testing.B) {
+			sim := chain.NewSimChain(0)
+			sim.Extend(total + b.N + 1)
+			st := store.NewMemoryStore()
+			ix := New(Config{StartHeight: 0, MaxReorgDepth: 64}, st, sim)
+			if err := ix.RunTo(ctx, uint64(total)); err != nil {
+				b.Fatal(err)
+			}
+			envs := make([]chain.Envelope, b.N)
+			for i := range envs {
+				env, err := sim.BlockAt(ctx, uint64(total+1+i))
+				if err != nil {
+					b.Fatal(err)
+				}
+				envs[i] = env
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := ix.Submit(ctx, envs[i]); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkReorgFixedDepth measures a fixed 3-block reorg at increasing chain
 // sizes. Reorg work must scale with the reorg depth, not the chain length:
 // rollback and replay only touch heights ancestor+1..tip.
