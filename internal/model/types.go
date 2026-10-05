@@ -92,6 +92,17 @@ const (
 	ReasonReorgTooDeep = "REORG_TOO_DEEP"
 )
 
+// AddressSummary is the per-address aggregate derived from the main tx
+// index. TxCount counts distinct transactions involving the address (a
+// self-transfer from==to is counted once); Inflow sums amounts where the
+// address is the recipient and Outflow sums amounts where it is the sender.
+type AddressSummary struct {
+	Address Address
+	TxCount int64
+	Inflow  int64
+	Outflow int64
+}
+
 // FailureRecord is persisted for every rejected record so failures are
 // auditable and never silently lost.
 type FailureRecord struct {

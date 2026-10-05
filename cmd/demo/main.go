@@ -11,7 +11,10 @@ import (
 	"sync"
 
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/chain"
+	"github.com/lisama569/onchain-reorg-indexer-go/internal/decode"
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/index"
+	"github.com/lisama569/onchain-reorg-indexer-go/internal/model"
+	"github.com/lisama569/onchain-reorg-indexer-go/internal/query"
 	"github.com/lisama569/onchain-reorg-indexer-go/internal/store"
 )
 
@@ -87,9 +90,80 @@ func main() {
 	}
 	wg.Wait()
 	printStats(ctx, ix2)
+
+	fmt.Println("\n== phase 5: address query + summary (paged read model) ==")
+	q := query.New(st2)
+	// A participant from the first indexed block (height 10, branch index 0):
+	// it stays canonical across every reorg, so it always has activity.
+	persistentAddr, err := decode.ParseAddress(chain.AddressSeed("canonical:to:0:0"))
+	must(err)
+	printAddress(ctx, q, persistentAddr, "persistent participant after all phases")
+
+	// The recipient of the pre-reorg canonical block 17's first tx. That block
+	// was rolled back in phase 3, so the address must have no activity now:
+	// the derived view never resurrects stale-branch txs.
+	staleAddr, err := decode.ParseAddress(chain.AddressSeed("canonical:to:7:0"))
+	must(err)
+	printAddress(ctx, q, staleAddr, "rolled-back canonical-17 recipient")
+
+	// A second reorg to show the query model follows the branch switch and
+	// keeps agreeing with the primary index.
+	must(sim2.ForkAt("alt2", sim2.Head()-1))
+	sim2.Extend(2)
+	ix2.BindSource(sim2)
+	must(ix2.RunTo(ctx, sim2.Head()))
+	printStats(ctx, ix2)
+	printAddress(ctx, q, persistentAddr, "persistent participant post-second-reorg")
+	printAddress(ctx, q, staleAddr, "rolled-back recipient post-second-reorg")
+
 	must(ix2.Close())
 
 	fmt.Println("\nsnapshot written to", snap)
+}
+
+// printAddress pages through all transactions involving addr and prints the
+// aggregate summary, demonstrating keyset pagination over the derived index.
+func printAddress(ctx context.Context, q *query.Service, addr model.Address, phase string) {
+	summary, ok, err := q.Summary(ctx, addr)
+	must(err)
+	if !ok {
+		fmt.Printf("[%s] address %s: no indexed activity\n", phase, addr.Hex())
+		return
+	}
+	var (
+		page  query.Page
+		count int
+		first model.IndexedTx
+		last  model.IndexedTx
+	)
+	page.Limit = 2
+	for {
+		res, err := q.Transactions(ctx, addr, page)
+		must(err)
+		if count == 0 && len(res.Txs) > 0 {
+			first = res.Txs[0]
+		}
+		count += len(res.Txs)
+		if len(res.Txs) > 0 {
+			last = res.Txs[len(res.Txs)-1]
+		}
+		if !res.HasNext {
+			break
+		}
+		page.AfterHeight = res.NextHeight
+		page.AfterIndex = res.NextIndex
+		page.HasCursor = true
+	}
+	fmt.Printf("[%s] address %s: txs=%d inflow=%d outflow=%d\n",
+		phase, addr.Hex()[:10], summary.TxCount, summary.Inflow, summary.Outflow)
+	if count > 0 {
+		fmt.Printf("           paged=%d rows (limit=2/page), range h=%d/%d .. h=%d/%d\n",
+			count, first.BlockHeight, first.Index, last.BlockHeight, last.Index)
+	}
+	if int64(count) != summary.TxCount {
+		fmt.Fprintf(os.Stderr, "fatal: address listing count %d != summary tx count %d\n", count, summary.TxCount)
+		os.Exit(1)
+	}
 }
 
 func printStats(ctx context.Context, ix *index.Indexer) {

@@ -18,7 +18,15 @@ type Tx interface {
 	ListTxs(height uint64) ([]model.IndexedTx, error)
 	PutFailure(f model.FailureRecord) (bool, error)
 	ListFailures() ([]model.FailureRecord, error)
+	CountFailures() (int, error)
 	MaxHeight() (uint64, bool, error)
+	// GetAddressSummary returns the aggregate counters for an address.
+	GetAddressSummary(addr model.Address) (model.AddressSummary, bool, error)
+	// ListAddressTxs returns at most limit transactions involving addr,
+	// ordered ascending by (block height, in-block index). When hasCursor is
+	// true the page starts strictly after (afterHeight, afterIndex);
+	// otherwise it starts at the address's first transaction.
+	ListAddressTxs(addr model.Address, afterHeight, afterIndex uint64, hasCursor bool, limit int) ([]model.IndexedTx, error)
 	// Commit atomically flushes all mutations performed in the transaction.
 	Commit() error
 	Rollback()

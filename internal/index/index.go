@@ -546,11 +546,11 @@ func (ix *Indexer) Stats(ctx context.Context) (Stats, error) {
 		} else {
 			st.NextHeight = ix.cfg.StartHeight
 		}
-		fails, verr := tx.ListFailures()
+		fails, verr := tx.CountFailures()
 		if verr != nil {
 			return verr
 		}
-		st.Failures = len(fails)
+		st.Failures = fails
 		return nil
 	})
 	if err != nil {
